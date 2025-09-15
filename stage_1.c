@@ -1,16 +1,15 @@
-/* stm32_ecg_final_led_swapped.c
- * Final STM32F4 ECG Processing
- * - ECG simulated generator (normal, flatline, abnormal)
- * - Preprocessing: bandpass + notch + wavelet
+/* stm32_ecg_final_seq.c
+ * STM32F4 ECG Processing - Final Version with Ordered Simulation
+ * - ECG simulated generator: Normal → Abnormal → Normal → NoData → Normal
+ * - Preprocessing (bandpass + notch + wavelet)
  * - QRS detection + BPM
- * - Adaptive windowing: 5s normal / 3s abnormal
+ * - Adaptive window (5s normal / 3s abnormal)
  * - LED logic:
- *   * First 5s warm-up (all LEDs OFF)
- *   * Then startup indication: all 3 LEDs ON for 2s
- *   * PC13 + PB9 ON if 2s no data
- *   * PC14 ON if abnormal ECG
- *   * All OFF if normal ECG
- * - Mode switches every 5s
+ *   * 0–5s warm-up: all OFF
+ *   * 5–7s startup: all ON
+ *   * Normal: all OFF
+ *   * Abnormal: PC14 ON
+ *   * No data ≥2s: PC13 + PB9 ON
  */
 
 #include "stm32f4xx.h"
@@ -20,12 +19,12 @@
 
 /* ---------------- Config ---------------- */
 #define FS               250
-#define NORMAL_WINDOW    (5*FS)   // 5s = 1250 samples
-#define ALERT_WINDOW     (3*FS)   // 3s = 750 samples
-#define STARTUP_MS       2000     // all LEDs ON after warm-up
-#define WARMUP_MS        5000     // 5s warm-up
-#define NODATA_TIMEOUT   2000     // 2s no data = alert
-#define SWITCH_INTERVAL  5000     // 5s per mode
+#define NORMAL_WINDOW    (5*FS)
+#define ALERT_WINDOW     (3*FS)
+#define STARTUP_MS       2000
+#define WARMUP_MS        5000
+#define NODATA_TIMEOUT   2000
+#define SWITCH_INTERVAL  5000   // 5s per mode
 
 /* ---------------- Globals ---------------- */
 volatile uint32_t msTicks = 0;
@@ -35,14 +34,12 @@ volatile uint32_t last_sample_time_ms = 0;
 volatile uint32_t last_data_time_ms   = 0;
 int abnormal = 0;
 
-typedef enum { ECG_NORMAL, ECG_FLATLINE, ECG_ABNORMAL } ECGMode;
-ECGMode sim_mode = ECG_NORMAL;
+typedef enum { ECG_NORMAL1, ECG_ABNORMAL, ECG_NORMAL2, ECG_NODATA } ECGMode;
+ECGMode sim_mode = ECG_NORMAL1;
 uint32_t sim_switch_time = 0;
 
 /* ---------------- SysTick ---------------- */
 void SysTick_Handler(void) { msTicks++; }
-
-/* ---------------- Delay ---------------- */
 static void delay_ms(uint32_t ms) {
     uint32_t start = msTicks;
     while ((msTicks - start) < ms) { __NOP(); }
@@ -56,10 +53,10 @@ static void GPIO_LED_Init(void) {
     GPIOB->MODER &= ~(3U<<(9*2));
     GPIOB->MODER |=  (1U<<(9*2));
 
-    // All OFF at startup
-    GPIOC->ODR |= (1U<<13);   // PC13 off (active low)
-    GPIOC->ODR &= ~(1U<<14);  // PC14 off
-    GPIOB->ODR &= ~(1U<<9);   // PB9 off
+    // All OFF initially
+    GPIOC->ODR |= (1U<<13);   // PC13 OFF (active low)
+    GPIOC->ODR &= ~(1U<<14);  // PC14 OFF
+    GPIOB->ODR &= ~(1U<<9);   // PB9 OFF
 }
 
 /* ---------------- ECG Template ---------------- */
@@ -77,24 +74,25 @@ static float ECG_Template(float t) {
 static float ECG_ReadSimulated(void) {
     static float t = 0.0f;
 
-    // Switch scenarios every 5s
+    // Switch mode every 5s in desired order
     if (msTicks - sim_switch_time > SWITCH_INTERVAL) {
-        if (sim_mode == ECG_NORMAL) sim_mode = ECG_FLATLINE;
-        else if (sim_mode == ECG_FLATLINE) sim_mode = ECG_NORMAL;
-        else if (sim_mode == ECG_NORMAL) sim_mode = ECG_ABNORMAL;
+        if (sim_mode == ECG_NORMAL1) sim_mode = ECG_ABNORMAL;
+        else if (sim_mode == ECG_ABNORMAL) sim_mode = ECG_NORMAL2;
+        else if (sim_mode == ECG_NORMAL2) sim_mode = ECG_NODATA;
+        else sim_mode = ECG_NORMAL1;
         sim_switch_time = msTicks;
     }
 
-    if (sim_mode == ECG_FLATLINE) {
-        return 0.0f; // no data
+    if (sim_mode == ECG_NODATA) {
+        return 0.0f; // flatline
     }
     else if (sim_mode == ECG_ABNORMAL) {
         t += 1.0f/FS;
-        return 0.5f*sinf(2*3.14159f*3.0f*t); // tachy-like
+        return 0.5f*sinf(2*3.14159f*3.0f*t); // fast abnormal
     }
-    else { // ECG_NORMAL
+    else { // normal1 or normal2
         t += 1.0f/FS;
-        float base = ECG_Template(fmodf(t,0.8f)); // ~75 BPM
+        float base = ECG_Template(fmodf(t,0.8f));
         base += 0.02f*((rand()%100)/100.0f-0.5f);
         return base;
     }
@@ -110,14 +108,12 @@ static inline float biquad_process(Biquad *b, float x) {
     b->z2 = b->b2*x - b->a2*y;
     return y;
 }
-
 static void filters_init(void) {
-    // Example coefficients (replace with designed ones!)
     bp_bq = (Biquad){0.0675f, 0.0f, -0.0675f, -1.1380f, 0.4866f, 0,0};
     notch_bq = (Biquad){0.98799f, -1.8741f, 0.98799f, -1.8741f, 0.97599f, 0,0};
 }
 
-/* ---------------- Haar DWT ---------------- */
+/* ---------------- Haar Wavelet ---------------- */
 static void haar_denoise(float *x, int N, float thr) {
     static float approx[NORMAL_WINDOW/2], detail[NORMAL_WINDOW/2];
     int half = N/2;
@@ -181,22 +177,19 @@ static void process_window(float *win,int N){
 /* ---------------- LED Logic ---------------- */
 static void update_leds(void){
     if((msTicks-last_data_time_ms)>NODATA_TIMEOUT){
-        // No data ≥2s → PC13 + PB9 ON
         GPIOC->ODR &= ~(1U<<13); // PC13 ON (active low)
         GPIOC->ODR &= ~(1U<<14); // PC14 OFF
         GPIOB->ODR |= (1U<<9);   // PB9 ON
     }
     else if(abnormal){
-        // Abnormal → PC14 ON
         GPIOC->ODR |= (1U<<13);  // PC13 OFF
         GPIOC->ODR |= (1U<<14);  // PC14 ON
         GPIOB->ODR &= ~(1U<<9);  // PB9 OFF
     }
     else {
-        // Normal → all OFF
-        GPIOC->ODR |= (1U<<13);
-        GPIOC->ODR &= ~(1U<<14);
-        GPIOB->ODR &= ~(1U<<9);
+        GPIOC->ODR |= (1U<<13);  // PC13 OFF
+        GPIOC->ODR &= ~(1U<<14);// PC14 OFF
+        GPIOB->ODR &= ~(1U<<9); // PB9 OFF
     }
 }
 
@@ -206,19 +199,16 @@ int main(void){
     GPIO_LED_Init();
     filters_init();
 
-    // ---- Warm-up first (5s, all OFF) ----
-    GPIOC->ODR |= (1U<<13);
-    GPIOC->ODR &= ~(1U<<14);
-    GPIOB->ODR &= ~(1U<<9);
+    // Warm-up 0–5s: all OFF
     delay_ms(WARMUP_MS);
 
-    // ---- Startup indication: all ON for 2s ----
-    GPIOC->ODR &= ~(1U<<13); // PC13 ON (active low)
-    GPIOC->ODR |=  (1U<<14); // PC14 ON
-    GPIOB->ODR |=  (1U<<9);  // PB9 ON
+    // Startup indication 5–7s: all ON
+    GPIOC->ODR &= ~(1U<<13);
+    GPIOC->ODR |=  (1U<<14);
+    GPIOB->ODR |=  (1U<<9);
     delay_ms(STARTUP_MS);
 
-    // Turn OFF after indication
+    // Back to OFF
     GPIOC->ODR |= (1U<<13);
     GPIOC->ODR &= ~(1U<<14);
     GPIOB->ODR &= ~(1U<<9);
