@@ -1,0 +1,24 @@
+Dataset : MIT-BIH Database from Kaggle
+(in the dataset)
+Shape : 1200 rows 56 columns
+Target : ECG Signal with 4 class (Arrhythmia,ATrial Fibrillation,Congestive Heart Failure,Normal Sinus Rhythm)
+
+(developed sample model)
+_The developed model is a RandomForest which is trained and evaluated based on the pre-processed dataset that is available and the results are saved.
+_The results are saved as a file with 
+trained RandomForest model (.joblib)
+features used to train the model (.json)
+label encoder file that has maping of class names to numbers (.joblib)
+confusion matrix image shows the classification performance (.png)
+filtered data scaler that is used for preprocessing features (.joblib).
+_Based on the give dataset Heart Rate(bpm) can be predicted which is used for classifying the data into categories 
+Arrhythmia(irregular HR)
+Bradycardia(HR<60bpm)
+Tachycardia(HR>100bpm)
+Normal (60<=HR<=100)
+
+Fianl results
+Overall Accuracy : 0.995833333333333
+Final classes : Arrhythmia, Tachycardia
+NOTE: Only two final classes exist because none of the instances of the dataset is meeting the criteria for Normal and Bradycardia classes
+
