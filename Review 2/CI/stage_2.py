@@ -113,249 +113,257 @@ while True:
         except ValueError:
             continue
 '''
-
 # above is the initial code
 
-#!/usr/bin/env python3
-"""
-stage_2.py - End-to-end ECG classification pipeline for ECGdata.csv
-
-Place ECGdata.csv in the same folder and run:
-    python stage_2.py --csv ECGdata.csv --outdir outputs
-
-The script will:
- - load CSV
- - run basic EDA (shape + class counts)
- - preprocess (drop high-missing columns, impute medians, scale)
- - train RandomForest baseline and a PyTorch MLP (optional)
- - evaluate and save models + artifacts (scaler, label encoder, feature list)
-"""
-'''
-import os
-import argparse
-import json
 import numpy as np
-import pandas as pd
+import os
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-import joblib
-import matplotlib.pyplot as plt
+from sklearn.utils.class_weight import compute_class_weight
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from scipy.signal import butter, filtfilt, iirnotch
+import pywt
+import skfuzzy as fuzz
+import skfuzzy.control as ctrl
 
-# Optional PyTorch model
-try:
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import TensorDataset, DataLoader
-    TORCH_AVAILABLE = True
-except Exception:
-    TORCH_AVAILABLE = False
+# ---------------- Config ----------------
+FS = 250
+WINDOW_LEN = 5 * FS
+BATCH_SIZE = 32
+EPOCHS = 10
+LR = 1e-3
+NUM_CLASSES = 4   # Normal, Bradycardia, Tachycardia, Arrhythmia
 
-RANDOM_STATE = 42
+# ---------------- Preprocessing ----------------
+def bandpass_filter(sig, low=0.5, high=40, fs=FS, order=4):
+    nyq = 0.5 * fs
+    b, a = butter(order, [low/nyq, high/nyq], btype="band")
+    return filtfilt(b, a, sig)
 
-def load_data(csv_path):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV file not found: {csv_path}")
-    df = pd.read_csv(csv_path)
-    return df
+def notch_filter(sig, freq=50.0, fs=FS, Q=30.0):
+    b, a = iirnotch(freq/(fs/2), Q)
+    return filtfilt(b, a, sig)
 
-def basic_eda(df):
-    print("Dataset shape:", df.shape)
-    print("Columns:", df.columns.tolist())
-    print("Sample head:\n", df.head().T.iloc[:10])
-    if 'ECG_signal' in df.columns:
-        print("Label distribution:\n", df['ECG_signal'].value_counts())
+def wavelet_denoise(sig, wavelet="db4", level=1, thr=0.02):
+    coeffs = pywt.wavedec(sig, wavelet, level=level)
+    coeffs[1:] = [pywt.threshold(c, thr, mode="soft") for c in coeffs[1:]]
+    return pywt.waverec(coeffs, wavelet)
 
-def preprocess(df, label_col='ECG_signal', missing_threshold=0.5):
-    # Drop identifier columns if present
-    df = df.copy()
-    drop_candidates = ['RECORD', 'record', 'id', 'Id']
-    for c in drop_candidates:
-        if c in df.columns:
-            df = df.drop(columns=[c])
-    # Drop columns with too many missing values
-    missing_frac = df.isna().mean()
-    to_drop = missing_frac[missing_frac > missing_threshold].index.tolist()
-    if to_drop:
-        print(f"Dropping {len(to_drop)} columns with >{int(missing_threshold*100)}% missing: {to_drop}")
-        df = df.drop(columns=to_drop)
-    # Separate X/y
-    if label_col not in df.columns:
-        raise ValueError(f"Label column '{label_col}' not found in dataframe.")
-    X = df.drop(columns=[label_col])
-    y = df[label_col].astype(str)
-    # Impute numeric missing values with median
-    num_cols = X.select_dtypes(include=[np.number]).columns
-    for c in num_cols:
-        if X[c].isna().any():
-            med = X[c].median()
-            X[c] = X[c].fillna(med)
-    # If any non-numeric feature remains, drop or encode
-    nonnum = X.select_dtypes(include=['object', 'category']).columns.tolist()
-    if nonnum:
-        print(f"Warning: Dropping non-numeric columns: {nonnum}")
-        X = X.drop(columns=nonnum)
-    return X, y
+def preprocess_dataset(X):
+    print("🩺 Applying preprocessing filters (bandpass + notch + wavelet)...")
+    X_filt = []
+    for win in tqdm(X):
+        sig = bandpass_filter(win)
+        sig = notch_filter(sig)
+        sig = wavelet_denoise(sig)
+        X_filt.append(sig[:WINDOW_LEN])
+    return np.array(X_filt)
 
-def train_rf(X_train, y_train, n_estimators=200, random_state=RANDOM_STATE):
-    print("Training RandomForestClassifier...")
-    clf = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
-    clf.fit(X_train, y_train)
-    return clf
-
-def evaluate_model(model, X_test, y_test, label_encoder=None, outdir=None, prefix='rf'):
-    y_pred = model.predict(X_test)
-    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
-    print("Classification report:\n", classification_report(y_test, y_pred))
-    cm = confusion_matrix(y_test, y_pred, labels=sorted(set(y_test)))
-    if outdir:
-        plt.figure(figsize=(6,5))
-        plt.imshow(cm, interpolation='nearest')
-        plt.title(f"Confusion matrix: {prefix}")
-        plt.colorbar()
-        ticks = range(len(set(y_test)))
-        plt.xticks(ticks, sorted(set(y_test)), rotation=45)
-        plt.yticks(ticks, sorted(set(y_test)))
-        plt.ylabel('True label')
-        plt.xlabel('Predicted label')
-        plt.tight_layout()
-        plt.savefig(os.path.join(outdir, f"{prefix}_confusion.png"))
-        plt.close()
-    return y_pred
-
-# Simple feed-forward classifier in PyTorch
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dims, num_classes):
+# ---------------- CNN + GRU Model ----------------
+class ECGModel(nn.Module):
+    def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
-        layers = []
-        prev = input_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(prev, h))
-            layers.append(nn.ReLU())
-            layers.append(nn.BatchNorm1d(h))
-            layers.append(nn.Dropout(0.2))
-            prev = h
-        layers.append(nn.Linear(prev, num_classes))
-        self.net = nn.Sequential(*layers)
-    def forward(self, x):
-        return self.net(x)
+        self.cnn = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=7, padding=3), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, kernel_size=5, padding=2), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool1d(2)
+        )
+        self.gru = nn.GRU(64, 128, batch_first=True)
+        self.fc = nn.Linear(128, num_classes)
 
-def train_torch(X_train, y_train, X_val, y_val, num_classes, device=None, epochs=30, batch_size=32, lr=1e-3):
-    if not TORCH_AVAILABLE:
-        raise RuntimeError("PyTorch not available. Install torch to run the neural network.")
-    device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
-    print('Using device:', device)
-    Xtr = torch.tensor(X_train.values, dtype=torch.float32)
-    ytr = torch.tensor(y_train.values, dtype=torch.long)
-    Xv = torch.tensor(X_val.values, dtype=torch.float32)
-    yv = torch.tensor(y_val.values, dtype=torch.long)
-    train_ds = TensorDataset(Xtr, ytr)
-    val_ds = TensorDataset(Xv, yv)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    model = MLP(input_dim=X_train.shape[1], hidden_dims=[128,64], num_classes=num_classes).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
-    best_val_acc = 0.0
-    for epoch in range(1, epochs+1):
+    def forward(self, x):
+        x = self.cnn(x)                
+        x = x.permute(0, 2, 1)        
+        _, h = self.gru(x)            
+        return self.fc(h[-1])         
+
+# ---------------- Fuzzy Logic ----------------
+def build_fuzzy_system():
+    hr = ctrl.Antecedent(np.arange(30, 201, 1), 'hr')
+    confidence = ctrl.Antecedent(np.arange(0, 1.01, 0.01), 'confidence')
+    decision = ctrl.Consequent(np.arange(0, 4, 1), 'decision')
+
+    hr['brady'] = fuzz.trimf(hr.universe, [30, 30, 60])
+    hr['normal'] = fuzz.trimf(hr.universe, [60, 75, 100])
+    hr['tachy'] = fuzz.trimf(hr.universe, [100, 150, 200])
+
+    confidence['low'] = fuzz.trimf(confidence.universe, [0, 0, 0.5])
+    confidence['high'] = fuzz.trimf(confidence.universe, [0.5, 1, 1])
+
+    decision['brady'] = fuzz.trimf(decision.universe, [0, 0, 1])
+    decision['normal'] = fuzz.trimf(decision.universe, [1, 1, 2])
+    decision['tachy'] = fuzz.trimf(decision.universe, [2, 2, 3])
+    decision['arrhythmia'] = fuzz.trimf(decision.universe, [3, 3, 3])
+
+    rules = [
+        ctrl.Rule(hr['brady'] & confidence['high'], decision['brady']),
+        ctrl.Rule(hr['normal'] & confidence['high'], decision['normal']),
+        ctrl.Rule(hr['tachy'] & confidence['high'], decision['tachy']),
+        ctrl.Rule(confidence['low'], decision['arrhythmia'])
+    ]
+    return ctrl.ControlSystemSimulation(ctrl.ControlSystem(rules))
+
+# ---------------- Training ----------------
+def main():
+    # Load dataset
+    # Base directory = folder where stage_2.py is located
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    # Construct full paths
+    X_path = os.path.join(BASE_DIR, "X.npy")
+    y_path = os.path.join(BASE_DIR, "y.npy")
+
+    print("🔎 Looking for dataset files in:", BASE_DIR)
+
+    # Load
+    X = np.load(X_path)
+    y = np.load(y_path)
+
+
+    print("📂 Loaded dataset:", X.shape, y.shape)
+    
+    # Check class distribution BEFORE any processing
+    unique, counts = np.unique(y, return_counts=True)
+    print("🔎 Original class distribution:", dict(zip(unique, counts)))
+
+    # Remove classes with insufficient samples (need at least 2 for stratified split)
+    # This needs to happen FIRST, before any preprocessing
+    min_samples = 2
+    valid_classes = unique[counts >= min_samples]
+    mask = np.isin(y, valid_classes)
+    X, y = X[mask], y[mask]
+    
+    # Update class distribution after filtering
+    unique_after, counts_after = np.unique(y, return_counts=True)
+    print(f"✅ After filtering classes with <{min_samples} samples:")
+    print("   Class distribution:", dict(zip(unique_after, counts_after)))
+    print("   Total samples remaining:", len(X))
+    
+    if len(unique_after) < 2:
+        raise ValueError("Not enough classes with sufficient samples for training!")
+
+    # Relabel classes to be contiguous (0, 1, 2, ...)
+    label_map = {old_label: new_label for new_label, old_label in enumerate(unique_after)}
+    y_relabeled = np.array([label_map[label] for label in y])
+    print("🏷️ Relabeled classes:", label_map)
+    
+    # Update NUM_CLASSES to actual number of classes
+    global NUM_CLASSES
+    NUM_CLASSES = len(unique_after)
+    print(f"🎯 Training with {NUM_CLASSES} classes")
+
+    # Double-check that we can safely stratify
+    unique_final, counts_final = np.unique(y_relabeled, return_counts=True)
+    print("🔍 Final class check before split:", dict(zip(unique_final, counts_final)))
+    
+    # Ensure we can split with test_size=0.15
+    
+    test_size = 0.15
+    for class_label, count in zip(unique_final, counts_final):
+        test_samples = int(count * test_size)
+        train_samples = count - test_samples
+        if test_samples < 1 or train_samples < 1:
+            print(f"⚠️ Warning: Class {class_label} has only {count} samples.")
+            print(f"   This would result in {test_samples} test and {train_samples} train samples.")
+            # Use a smaller test size or remove stratification for very small datasets
+            if count < 4:  # If less than 4 samples, we can't reliably stratify
+                print("🚫 Removing stratification due to small dataset")
+                stratify_param = None
+                break
+    else:
+        stratify_param = y_relabeled
+    """
+    # Ensure we can split with test_size=0.15
+    test_size = 0.15
+    stratify_param = y_relabeled  # Initialize stratify parameter
+
+    for class_label, count in zip(unique_final, counts_final):
+        test_samples = int(count * test_size)
+        train_samples = count - test_samples
+        if test_samples < 1 or train_samples < 1:
+            print(f"⚠️ Warning: Class {class_label} has only {count} samples.")
+            print(f"   This would result in {test_samples} test and {train_samples} train samples.")
+            if count < 4:  # Not enough samples to stratify
+                print("🚫 Removing stratification due to small dataset")
+                stratify_param = None
+                break
+                """
+
+    # Preprocess dataset
+    X_processed = preprocess_dataset(X)
+
+    # Normalize per window
+    X_normalized = (X_processed - X_processed.mean(axis=1, keepdims=True)) / (X_processed.std(axis=1, keepdims=True) + 1e-8)
+
+    # Train-val split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_normalized, y_relabeled, test_size=test_size, stratify=stratify_param, random_state=0
+    )
+    
+    print(f"📊 Train samples: {len(X_train)}, Validation samples: {len(X_val)}")
+
+    train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32).unsqueeze(1),
+                             torch.tensor(y_train, dtype=torch.long))
+    val_ds = TensorDataset(torch.tensor(X_val, dtype=torch.float32).unsqueeze(1),
+                           torch.tensor(y_val, dtype=torch.long))
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+
+    # Device setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("⚡ Using device:", device)
+    model = ECGModel(num_classes=NUM_CLASSES).to(device)
+
+    # Weighted loss
+    class_weights = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
+    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+
+    # Train loop
+    for epoch in range(EPOCHS):
         model.train()
-        total_loss = 0.0
-        for xb, yb in train_loader:
+        running_loss = 0.0
+        for xb, yb in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
             xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
-            logits = model(xb)
-            loss = loss_fn(logits, yb)
-            loss.backward()
-            opt.step()
-            total_loss += loss.item() * xb.size(0)
-        avg_loss = total_loss / len(train_loader.dataset)
-        # validation
+            out = model(xb)
+            loss = criterion(out, yb)
+            opt.zero_grad(); loss.backward(); opt.step()
+            running_loss += loss.item()
+        avg_loss = running_loss / len(train_loader)
+
+        # Validation
         model.eval()
-        correct = 0
-        total = 0
+        correct = 0; total = 0
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
-                logits = model(xb)
-                preds = logits.argmax(dim=1)
+                out = model(xb)
+                preds = out.argmax(dim=1)
                 correct += (preds == yb).sum().item()
                 total += yb.size(0)
         val_acc = correct / total
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_state = model.state_dict()
-        print(f"Epoch {epoch}/{epochs}  loss={avg_loss:.4f}  val_acc={val_acc:.4f}")
-    # load best
-    model.load_state_dict(best_state)
-    return model
+        print(f"📊 Epoch {epoch+1} | Loss={avg_loss:.4f} | Val Acc={val_acc:.4f}")
 
-def save_artifacts(outdir, scaler, label_encoder, rf_model=None, torch_model=None, feature_columns=None):
-    os.makedirs(outdir, exist_ok=True)
-    if scaler is not None:
-        joblib.dump(scaler, os.path.join(outdir, 'scaler.joblib'))
-    if label_encoder is not None:
-        joblib.dump(label_encoder, os.path.join(outdir, 'label_encoder.joblib'))
-    if rf_model is not None:
-        joblib.dump(rf_model, os.path.join(outdir, 'rf_model.joblib'))
-    if feature_columns is not None:
-        with open(os.path.join(outdir, 'feature_columns.json'), 'w') as fh:
-            json.dump(list(feature_columns), fh)
-    if torch_model is not None:
-        import torch as _torch
-        _torch.save(torch_model.state_dict(), os.path.join(outdir, 'torch_model.pt'))
+    # Save model
+    os.makedirs("model_out", exist_ok=True)
+    torch.save(model.state_dict(), "model_out/ecg_classifier.pth")
+    
+    # Save label mapping for later use
+    np.save("model_out/label_mapping.npy", label_map)
+    print("✅ Model saved at model_out/ecg_classifier.pth")
+    print("✅ Label mapping saved at model_out/label_mapping.npy")
 
-def main(args):
-    df = load_data(args.csv)
-    basic_eda(df)
-    X, y = preprocess(df, label_col='ECG_signal', missing_threshold=0.5)
-    # encode labels
-    le = LabelEncoder()
-    y_enc = le.fit_transform(y)
-    print('Classes:', le.classes_)
-    # split
-    X_train, X_test, y_train, y_test = train_test_split(X, y_enc, test_size=args.test_size, random_state=RANDOM_STATE, stratify=y_enc)
-    # scaler
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    # Train RandomForest
-    rf = train_rf(pd.DataFrame(X_train_scaled, columns=X.columns), y_train)
-    # Evaluate RF
-    if args.outdir:
-        os.makedirs(args.outdir, exist_ok=True)
-    evaluate_model(rf, pd.DataFrame(X_test_scaled, columns=X.columns), y_test, outdir=args.outdir, prefix='rf')
-    # save artifacts (note: save scaler and label encoder with original X columns)
-    save_artifacts(args.outdir or '.', scaler, le, rf_model=rf, feature_columns=X.columns)
-    # Optional: train PyTorch net
-    if args.torch and TORCH_AVAILABLE:
-        # create a small val split from training set
-        X_tr, X_val, y_tr, y_val = train_test_split(X_train_scaled, y_train, test_size=0.2, random_state=RANDOM_STATE, stratify=y_train)
-        X_tr_df = pd.DataFrame(X_tr, columns=X.columns)
-        X_val_df = pd.DataFrame(X_val, columns=X.columns)
-        torch_model = train_torch(X_tr_df, pd.Series(y_tr), X_val_df, pd.Series(y_val), num_classes=len(le.classes_), epochs=args.epochs)
-        save_artifacts(args.outdir or '.', None, None, torch_model=torch_model, feature_columns=X.columns)
-        # evaluate torch on test set
-        import torch as _torch
-        device = _torch.device('cuda') if _torch.cuda.is_available() else _torch.device('cpu')
-        X_test_t = _torch.tensor(X_test_scaled, dtype=_torch.float32).to(device)
-        model = MLP(input_dim=X_test_t.shape[1], hidden_dims=[128,64], num_classes=len(le.classes_)).to(device)
-        model.load_state_dict(torch_model.state_dict())
-        model.eval()
-        with _torch.no_grad():
-            logits = model(X_test_t)
-            preds = logits.argmax(dim=1).cpu().numpy()
-        print('PyTorch test accuracy:', accuracy_score(y_test, preds))
-    elif args.torch and not TORCH_AVAILABLE:
-        print('Skipping PyTorch training: torch not available.')
+    # Example fuzzy logic
+    fuzzy = build_fuzzy_system()
+    example_hr = 150; example_conf = 0.9
+    fuzzy.input['hr'] = example_hr
+    fuzzy.input['confidence'] = example_conf
+    fuzzy.compute()
+    print(f"🤖 Fuzzy decision for HR={example_hr}, Conf={example_conf} → {fuzzy.output['decision']:.2f}")
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='ECG classification pipeline')
-    parser.add_argument('--csv', type=str, default='ECGdata.csv', help='Path to ECG CSV (default: ECGdata.csv)')
-    parser.add_argument('--outdir', type=str, default='outputs', help='Where to save models/artifacts')
-    parser.add_argument('--test_size', type=float, default=0.2, help='Test set fraction')
-    parser.add_argument('--torch', action='store_true', help='Also train a PyTorch MLP (if torch installed)')
-    parser.add_argument('--epochs', type=int, default=30, help='Epochs for PyTorch model')
-    args = parser.parse_args()
-    main(args)
-'''
+if __name__ == "__main__":
+    main()
