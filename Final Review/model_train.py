@@ -1,88 +1,97 @@
-# train_model.py
 import numpy as np
-import wfdb
-from wfdb import processing
-from sklearn.model_selection import train_test_split
+from scipy.signal import butter, filtfilt
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, GRU, Dense, Dropout
+from tensorflow.keras.utils import to_categorical
 from sklearn.preprocessing import StandardScaler
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Conv1D, GRU, Dense, Dropout, Flatten
-import joblib
-import skfuzzy as fuzz
+from sklearn.model_selection import train_test_split
+import wfdb
+import glob
+
+# -----------------------
+# ECG Preprocessing
+# -----------------------
+def bandpass_filter(signal, fs=250, low=0.5, high=40):
+    b, a = butter(2, [low/(fs/2), high/(fs/2)], btype='band')
+    return filtfilt(b, a, signal)
+
+def extract_segments(signal, ann_samples, window_size=250):
+    """
+    Extract ECG windows of length `window_size` with label based on beats in that window.
+    """
+    X, y = [], []
+    num_windows = len(signal)//window_size
+    for i in range(num_windows):
+        seg = signal[i*window_size:(i+1)*window_size]
+        beats = ann_samples[(ann_samples >= i*window_size) & (ann_samples < (i+1)*window_size)]
+        # Label assignment
+        if len(beats) == 0:
+            label = 0  # normal
+        else:
+            hr_est = 60.0 / (np.mean(np.diff(beats)/250) if len(beats) > 1 else 1)
+            if hr_est < 45:
+                label = 1  # bradycardia
+            elif hr_est > 140:
+                label = 2  # tachycardia
+            else:
+                label = 3  # arrhythmia
+        X.append(seg)
+        y.append(label)
+    return np.array(X), np.array(y)
 
 # -----------------------
 # Load MIT-BIH dataset
 # -----------------------
-# Example: use record '100'
-record = wfdb.rdrecord('mit-bih-arrhythmia-database-1.0.0/100')
-annotation = wfdb.rdann('mit-bih-arrhythmia-database-1.0.0/100', 'atr')
+record_paths = glob.glob("mit-bih-database/*.dat")  # path to MIT-BIH .dat files
+X_all, y_all = [], []
 
-# Extract ECG signal and labels
-signal = record.p_signal[:,0]  # use first lead
-labels = annotation.symbol
+for rec_file in record_paths:
+    record_name = rec_file.split('/')[-1].replace('.dat','')
+    record = wfdb.rdrecord(record_name, pn_dir='mit-bih-database')
+    ann = wfdb.rdann(record_name, 'atr', pn_dir='mit-bih-database')
+    signal = record.p_signal[:,0]  # Lead II
+    filtered = bandpass_filter(signal)
+    X_seg, y_seg = extract_segments(filtered, ann.sample)
+    X_all.append(X_seg)
+    y_all.append(y_seg)
+
+X_all = np.concatenate(X_all, axis=0)
+y_all = np.concatenate(y_all, axis=0)
 
 # -----------------------
-# Preprocessing
+# Scale and reshape
 # -----------------------
-# Simple bandpass: 0.5-40Hz
-fs = record.fs
-b, a = processing.butter_bandpass(0.5, 40, fs)
-signal_filtered = processing.filter_signal(signal, 'bandpass', f_low=0.5, f_high=40, fs=fs)
-
-# Sliding window segmentation (e.g., 5s windows)
-window_size = int(fs*5)
-X = []
-y = []
-
-for i in range(0, len(signal_filtered)-window_size, int(window_size/2)):
-    segment = signal_filtered[i:i+window_size]
-    # Label: if any abnormal beat in window, mark as abnormal
-    beat_labels = labels[np.searchsorted(annotation.sample, np.arange(i,i+window_size))]
-    label = 0 if any(l not in ['N','~'] for l in beat_labels) else 1  # 1=normal, 0=abnormal
-    X.append(segment)
-    y.append(label)
-
-X = np.array(X)
-y = np.array(y)
-
-# Standardize
 scaler = StandardScaler()
-X = scaler.fit_transform(X)
+X_all = scaler.fit_transform(X_all)
+X_all = X_all[..., np.newaxis]  # for Conv1D
 
-# Reshape for 1D-CNN/GRU [samples, timesteps, features]
-X = X[..., np.newaxis]
+# One-hot encode labels
+y_all = to_categorical(y_all, num_classes=4)
 
-# Train/test split
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X_all, y_all, test_size=0.2, random_state=42)
 
 # -----------------------
-# Build 1D-CNN + GRU
+# Model
 # -----------------------
-model = Sequential()
-model.add(Conv1D(32, kernel_size=5, activation='relu', input_shape=(X_train.shape[1],1)))
-model.add(Dropout(0.2))
-model.add(GRU(32, return_sequences=False))
-model.add(Dense(1, activation='sigmoid'))
+model = Sequential([
+    Conv1D(32, kernel_size=5, activation='relu', input_shape=(X_train.shape[1],1)),
+    Dropout(0.2),
+    GRU(32),
+    Dense(4, activation='softmax')
+])
 
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
 
+# -----------------------
 # Train
+# -----------------------
 model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=10, batch_size=64)
 
+# -----------------------
 # Save model and scaler
-model.save('router_model.h5')
-joblib.dump(scaler, 'scaler.pkl')
-
-print("✅ Model and scaler saved successfully.")
-
 # -----------------------
-# Fuzzy Logic (simple example)
-# -----------------------
-# Define fuzzy membership functions for HR
-hr_range = np.arange(0, 201, 1)
-normal = fuzz.trimf(hr_range, [50, 75, 100])
-brady = fuzz.trimf(hr_range, [0, 30, 60])
-tachy = fuzz.trimf(hr_range, [100, 150, 200])
-
-# Save fuzzy sets
-np.savez('fuzzy_hr_sets.npz', normal=normal, brady=brady, tachy=tachy)
-print("✅ Fuzzy sets saved.")
+model.save("ecg_classifier_4class.h5")
+import joblib
+joblib.dump(scaler, "scaler.save")
