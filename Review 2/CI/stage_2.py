@@ -416,7 +416,7 @@ def wavelet_denoise(sig, wavelet="db4", level=1, thr=0.02):
     return pywt.waverec(coeffs, wavelet)
 
 def preprocess_dataset(X):
-    print("🩺 Applying preprocessing filters (bandpass + notch + wavelet)...")
+    print("Applying preprocessing filters (bandpass + notch + wavelet)...")
     X_filt = []
     for win in tqdm(X):
         sig = bandpass_filter(win)
@@ -476,16 +476,16 @@ def main():
     X_path = os.path.join(BASE_DIR, "X.npy")
     y_path = os.path.join(BASE_DIR, "y.npy")
 
-    print("🔎 Looking for dataset files in:", BASE_DIR)
+    print("Looking for dataset files in:", BASE_DIR)
 
     X = np.load(X_path)
     y = np.load(y_path)
 
-    print("📂 Loaded dataset:", X.shape, y.shape)
+    print("Loaded dataset:", X.shape, y.shape)
     
     # Check class distribution
     unique, counts = np.unique(y, return_counts=True)
-    print("🔎 Original class distribution:", dict(zip(unique, counts)))
+    print("Original class distribution:", dict(zip(unique, counts)))
 
     # Remove under-represented classes
     min_samples = 2
@@ -494,14 +494,14 @@ def main():
     X, y = X[mask], y[mask]
     
     unique_after, counts_after = np.unique(y, return_counts=True)
-    print("✅ After filtering:", dict(zip(unique_after, counts_after)))
+    print("After filtering:", dict(zip(unique_after, counts_after)))
 
     # Relabel classes
     label_map = {old_label: new_label for new_label, old_label in enumerate(unique_after)}
     y_relabeled = np.array([label_map[label] for label in y])
     global NUM_CLASSES
     NUM_CLASSES = len(unique_after)
-    print("🏷️ Relabeled classes:", label_map)
+    print("Relabeled classes:", label_map)
 
     # Preprocess
     X_processed = preprocess_dataset(X)
@@ -518,7 +518,7 @@ def main():
         X_normalized, y_relabeled, test_size=test_size, stratify=stratify_param, random_state=0
     )
     
-    print(f"📊 Train samples: {len(X_train)}, Validation samples: {len(X_val)}")
+    print(f"Train samples: {len(X_train)}, Validation samples: {len(X_val)}")
 
     # Torch datasets
     train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32).unsqueeze(1),
@@ -530,7 +530,7 @@ def main():
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("⚡ Using device:", device)
+    print("Using device:", device)
     model = ECGModel(num_classes=NUM_CLASSES).to(device)
 
     # Weighted loss
@@ -566,7 +566,7 @@ def main():
                 correct += (preds == yb).sum().item()
                 total += yb.size(0)
         val_acc = correct / total
-        print(f"📊 Epoch {epoch+1} | Loss={avg_loss:.4f} | Val Acc={val_acc:.4f}")
+        print(f"Epoch {epoch+1} | Loss={avg_loss:.4f} | Val Acc={val_acc:.4f}")
 
     # Metrics
     print("\n---------------- Classification Report ----------------")
@@ -578,7 +578,7 @@ def main():
     os.makedirs("model_out", exist_ok=True)
     torch.save(model.state_dict(), "model_out/ecg_classifier.pth")
     np.save("model_out/label_mapping.npy", label_map)
-    print("✅ Model + label mapping saved")
+    print("Model + label mapping saved")
 
     # Example fuzzy logic
     fuzzy = build_fuzzy_system()
@@ -586,7 +586,7 @@ def main():
     fuzzy.input['hr'] = example_hr
     fuzzy.input['confidence'] = example_conf
     fuzzy.compute()
-    print(f"🤖 Fuzzy decision for HR={example_hr}, Conf={example_conf} → {fuzzy.output['decision']:.2f}")
+    print(f"Fuzzy decision for HR={example_hr}, Conf={example_conf} → {fuzzy.output['decision']:.2f}")
 
 if __name__ == "__main__":
     main()
