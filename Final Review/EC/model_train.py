@@ -144,4 +144,4 @@ best_params = best
 final_model = create_model(best_params)
 final_model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=10, batch_size=64)
 final_model.save("ecg_classifier_model_using_GA.h5")
-print("Model saved as ecg_classifier_model.h5")
+print("Model saved as ecg_classifier_model_using_GA.h5")
