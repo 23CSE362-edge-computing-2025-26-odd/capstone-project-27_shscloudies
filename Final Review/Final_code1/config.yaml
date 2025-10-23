@@ -1,0 +1,31 @@
+# config.yaml
+gateway:
+  id: gw-01
+  location_km: 0.0
+  http_port: 8000
+
+routers:
+  - id: router-01
+    location_km: 0.13       # 130 m from gateway
+    antenna_gain_db: 2.4
+    devices:                 # ← ADDED: Devices assigned to router-01
+      - device_01            # Normal (75 bpm)
+      - device_02            # Bradycardia (45 bpm)
+  
+  - id: router-02
+    location_km: 2.4        # 2.4 km from gateway (paper example)
+    antenna_gain_db: 3.5
+    devices:                 # ← ADDED: Devices assigned to router-02
+      - device_03            # Tachycardia (150 bpm)
+      - device_04            # Arrhythmia (irregular)
+      - device_05            # Cardiac Arrest (flatline)
+
+loRa_defaults:
+  sf: 9       # spreading factor
+  bw: 125000  # Hz
+  cr: 4/7
+  tx_power_dbm: 14
+
+ble_range_km: 0.1        # 100 m BLE range
+propagation_speed_m_per_s: 300000000.0
+packet_loss_base: 0.01   # baseline packet loss
